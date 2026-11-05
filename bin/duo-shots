@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+# duo-shots - capture App Store screenshots for iPhone Duo (both displays)
+# from the iOS Simulator. MIT licensed. https://github.com/ch8er/iphone-duo-screenshots
+#
+# Works with the stock macOS bash (3.2). Needs Xcode 27.1+ with the iOS 27.1
+# simulator runtime, plus the `hinge` CLI to fold and unfold the simulator.
+
+set -u
+set -o pipefail
+
+VERSION="0.1.0"
+PROG="duo-shots"
+
+SETTLE="${DUO_SHOTS_SETTLE:-2.5}"            # seconds to wait after a fold/unfold
+RETRIES="${DUO_SHOTS_RETRIES:-4}"            # capture attempts per display
+STABLE_GAP="${DUO_SHOTS_STABLE_GAP:-1}"      # seconds between the two stability captures
+STABLE="${DUO_SHOTS_STABLE:-1}"              # 0 = skip the "two identical captures" check
+OUTER_DISPLAY="${DUO_SHOTS_OUTER_DISPLAY:-1}"
+INNER_DISPLAY="${DUO_SHOTS_INNER_DISPLAY:-3}"
+DEVICE="${DUO_SHOTS_DEVICE:-}"
+OUT_DIR="${DUO_SHOTS_OUT:-./duo-shots}"
+
+# Apple's iPhone Duo screenshot sizes (App Store Connect screenshot specifications).
+# outer display: 1398 x 2034 / 2034 x 1398   inner display: 2007 x 2853 / 2853 x 2007
+MAX_PER_SLOT=10
+
+EX_FAIL=1
+EX_USAGE=2
+EX_ENV=3
+
+die() {
+  printf '%s: %s\n' "$PROG" "$1" >&2
+  exit "${2:-$EX_FAIL}"
+}
+warn() { printf '%s: warning: %s\n' "$PROG" "$1" >&2; }
+info() { printf '%s\n' "$1"; }
+
+usage() {
+  cat <<'EOF'
+duo-shots - App Store screenshots for iPhone Duo (outer and inner display) from the Simulator
+
+Usage:
+  duo-shots boot                  Create (if needed), boot and wait for an iPhone Duo simulator
+  duo-shots status-bar [set|clear]
+                                  Clean status bar: 9:41, full battery, full Wi-Fi/cellular bars
+  duo-shots shoot [options] <name>
+                                  Capture the screen the app shows now: outer display (folded),
+                                  then inner display (unfolded). Writes outer-NN-<name>.png and
+                                  inner-NN-<name>.png to the output folder, then validates them
+  duo-shots check <file|dir>...   Validate screenshots: Apple's iPhone Duo sizes, no alpha channel,
+                                  not a black frame, at most 10 per display
+  duo-shots help | version
+
+Global options (any command):
+  -d, --device <udid|name>        Simulator to use (default: the one booted iPhone Duo)
+
+shoot options:
+  -o, --out <dir>                 Output folder (default ./duo-shots, or $DUO_SHOTS_OUT)
+  -n, --index <number>            File number NN (default: next free number in the folder)
+      --only outer|inner|both     Which display to capture (default both)
+      --no-fold                   Do not call hinge; capture whichever display is active
+      --no-status-bar             Leave the status bar alone
+      --settle <seconds>          Wait after fold/unfold (default 2.5, or $DUO_SHOTS_SETTLE)
+
+Environment: DUO_SHOTS_DEVICE, DUO_SHOTS_OUT, DUO_SHOTS_SETTLE, DUO_SHOTS_RETRIES,
+DUO_SHOTS_STABLE (0 = skip the stability check), DUO_SHOTS_OUTER_DISPLAY (1), DUO_SHOTS_INNER_DISPLAY (3).
+
+Exit status: 0 ok, 1 a capture or check failed, 2 usage error, 3 missing tool or simulator.
+Docs: https://github.com/ch8er/iphone-duo-screenshots
+EOF
+}
+
+# ---------------------------------------------------------------- image checks
+
+slot_of() { # width height -> outer | inner | (empty)
+  case "$1x$2" in
+    1398x2034 | 2034x1398) echo outer ;;
+    2007x2853 | 2853x2007) echo inner ;;
+    *) echo "" ;;
+  esac
+}
+
+read_props() { # file -> sets P_W P_H P_ALPHA
+  local out
+  out=$(sips -g pixelWidth -g pixelHeight -g hasAlpha "$1" 2>/dev/null) || return 1
+  P_W=$(printf '%s\n' "$out" | awk '/pixelWidth/ {print $2}')
+  P_H=$(printf '%s\n' "$out" | awk '/pixelHeight/ {print $2}')
+  P_ALPHA=$(printf '%s\n' "$out" | awk '/hasAlpha/ {print $2}')
+  [ -n "$P_W" ] && [ -n "$P_H" ]
+}
+
+# returns 0 when every pixel is black, 1 when it is not, 2 when it cannot tell
+is_all_black() {
+  local bmp off rest
+  bmp=$(mktemp "${TMPDIR:-/tmp}/duo-shots.XXXXXX") || return 2
+  if ! sips -s format bmp "$1" --out "$bmp" >/dev/null 2>&1; then
+    rm -f "$bmp"
+    return 2
+  fi
+  off=$(od -An -t u4 -j 10 -N 4 "$bmp" | tr -d ' ')
+  case "$off" in '' | *[!0-9]*)
+    rm -f "$bmp"
+    return 2
+    ;;
+  esac
+  rest=$(tail -c +$((off + 1)) "$bmp" | tr -d '\000' | head -c 1)
+  rm -f "$bmp"
+  [ -z "$rest" ]
+}
+
+# check_file <file> -> prints one line, sets CHECK_SLOT, returns 0 (ok) / 1 (fail)
+check_file() {
+  local f=$1 base problems="" slot named="" orient rc
+  base=$(basename "$f")
+  CHECK_SLOT=""
+  if [ ! -f "$f" ]; then
+    printf 'FAIL %s: file not found\n' "$base"
+    return 1
+  fi
+  if ! read_props "$f"; then
+    printf 'FAIL %s: not a readable image\n' "$base"
+    return 1
+  fi
+  slot=$(slot_of "$P_W" "$P_H")
+  CHECK_SLOT=$slot
+  if [ -z "$slot" ]; then
+    problems="size ${P_W}x${P_H} is not an iPhone Duo size (outer 1398x2034, inner 2007x2853, either orientation)"
+  fi
+  case "$base" in
+    outer-*) named=outer ;;
+    inner-*) named=inner ;;
+  esac
+  if [ -n "$slot" ] && [ -n "$named" ] && [ "$slot" != "$named" ]; then
+    problems="${problems:+$problems; }has the $slot size but is named $named-*"
+  fi
+  if [ "${P_ALPHA:-no}" = "yes" ]; then
+    problems="${problems:+$problems; }has an alpha channel (capture with --mask=black)"
+  fi
+  is_all_black "$f"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    problems="${problems:+$problems; }all-black frame (the display was off or still switching)"
+  fi
+  if [ -n "$problems" ]; then
+    printf 'FAIL %s: %s\n' "$base" "$problems"
+    return 1
+  fi
+  if [ "$P_W" -le "$P_H" ]; then orient=portrait; else orient=landscape; fi
+  printf 'ok   %s  %s %sx%s %s\n' "$base" "$slot" "$P_W" "$P_H" "$orient"
+}
+
+cmd_check() {
+  local a f n_ok=0 n_fail=0 n_outer=0 n_inner=0 files=()
+  [ $# -gt 0 ] || die "check needs at least one file or folder (see: $PROG help)" $EX_USAGE
+  command -v sips >/dev/null 2>&1 || die "sips not found (macOS only)" $EX_ENV
+  for a in "$@"; do
+    if [ -d "$a" ]; then
+      for f in "$a"/*.png "$a"/*.jpg "$a"/*.jpeg; do
+        [ -f "$f" ] && files+=("$f")
+      done
+    elif [ -e "$a" ]; then
+      files+=("$a")
+    else
+      die "no such file or folder: $a" $EX_USAGE
+    fi
+  done
+  [ "${#files[@]}" -gt 0 ] || die "no .png/.jpg/.jpeg files found" $EX_USAGE
+  for f in "${files[@]}"; do
+    if check_file "$f"; then
+      n_ok=$((n_ok + 1))
+    else
+      n_fail=$((n_fail + 1))
+    fi
+    case "$CHECK_SLOT" in
+      outer) n_outer=$((n_outer + 1)) ;;
+      inner) n_inner=$((n_inner + 1)) ;;
+    esac
+  done
+  if [ "$n_outer" -gt "$MAX_PER_SLOT" ]; then
+    printf 'FAIL %s outer screenshots: App Store Connect accepts at most %s per display size\n' "$n_outer" "$MAX_PER_SLOT"
+    n_fail=$((n_fail + 1))
+  fi
+  if [ "$n_inner" -gt "$MAX_PER_SLOT" ]; then
+    printf 'FAIL %s inner screenshots: App Store Connect accepts at most %s per display size\n' "$n_inner" "$MAX_PER_SLOT"
+    n_fail=$((n_fail + 1))
+  fi
+  printf '%s checked: %s ok, %s failed (outer %s, inner %s)\n' "${#files[@]}" "$n_ok" "$n_fail" "$n_outer" "$n_inner"
+  [ "$n_fail" -eq 0 ]
+}
+
+# ---------------------------------------------------------------- simulator
+
+need_xcrun() {
+  command -v xcrun >/dev/null 2>&1 || die "xcrun not found. Install Xcode 27.1 or later." $EX_ENV
+}
+
+need_hinge() {
+  command -v hinge >/dev/null 2>&1 ||
+    die "hinge not found. Install it: brew install artemnovichkov/tap/hinge (or use --no-fold)." $EX_ENV
+}
+
+is_duo_device() { # udid-or-name: a simulator with a second integrated screen
+  xcrun simctl io "$1" enumerate 2>/dev/null | grep -q 'Device Name: primary-1'
+}
+
+resolve_device() {
+  need_xcrun
+  local id found="" count=0
+  if [ -n "$DEVICE" ]; then
+    is_duo_device "$DEVICE" ||
+      die "'$DEVICE' is not a booted iPhone Duo simulator (no second screen). Run: $PROG boot" $EX_ENV
+    return 0
+  fi
+  for id in $(xcrun simctl list devices booted 2>/dev/null | grep -Eo '[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}'); do
+    if is_duo_device "$id"; then
+      found=$id
+      count=$((count + 1))
+    fi
+  done
+  case "$count" in
+    0) die "no booted iPhone Duo simulator. Run: $PROG boot" $EX_ENV ;;
+    1) DEVICE=$found ;;
+    *) die "several iPhone Duo simulators are booted. Pass --device <udid>." $EX_ENV ;;
+  esac
+}
+
+duo_runtime() { # newest installed iOS runtime that has iPhone Duo (27.1+)
+  xcrun simctl list runtimes available 2>/dev/null |
+    grep -Eo 'com\.apple\.CoreSimulator\.SimRuntime\.iOS-(27-[1-9][0-9]*|2[89]-[0-9]+|[3-9][0-9]-[0-9]+)' |
+    tail -n 1
+}
+
+cmd_boot() {
+  need_xcrun
+  local id="" runtime
+  if [ -n "$DEVICE" ]; then
+    id=$DEVICE
+  else
+    id=$(xcrun simctl list devices available 2>/dev/null | grep -E '^ +iPhone Duo \(' |
+      grep -Eo '[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}' | head -n 1)
+  fi
+  if [ -z "$id" ]; then
+    runtime=$(duo_runtime)
+    [ -n "$runtime" ] ||
+      die "no iOS 27.1+ simulator runtime installed. Install it in Xcode > Settings > Components." $EX_ENV
+    info "creating an iPhone Duo simulator ($runtime)"
+    id=$(xcrun simctl create "iPhone Duo" "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo" "$runtime") ||
+      die "simctl create failed" $EX_ENV
+  fi
+  info "booting $id"
+  xcrun simctl bootstatus "$id" -b >/dev/null 2>&1 || die "simulator did not boot: $id" $EX_ENV
+  DEVICE=$id
+  is_duo_device "$DEVICE" || die "$id booted, but it is not an iPhone Duo (no second screen)" $EX_ENV
+  info "ready: $id"
+}
+
+cmd_status_bar() {
+  local action="${1:-set}"
+  resolve_device
+  case "$action" in
+    set)
+      xcrun simctl status_bar "$DEVICE" override --time 9:41 \
+        --batteryState charged --batteryLevel 100 --wifiBars 3 --cellularBars 4 ||
+        die "status bar override failed" $EX_FAIL
+      info "status bar: 9:41, battery 100% charged, Wi-Fi 3 bars, cellular 4 bars"
+      ;;
+    clear)
+      xcrun simctl status_bar "$DEVICE" clear || die "status bar clear failed" $EX_FAIL
+      info "status bar overrides cleared"
+      ;;
+    *) die "status-bar takes 'set' or 'clear'" $EX_USAGE ;;
+  esac
+}
+
+fold() { # close | open
+  hinge -d "$DEVICE" "$1" >/dev/null 2>&1 || die "hinge $1 failed (hinge works with Xcode 27.1+ and a booted iPhone Duo)" $EX_FAIL
+  sleep "$SETTLE"
+}
+
+simctl_shot() { # display file
+  local err
+  err=$(xcrun simctl io "$DEVICE" screenshot --display="$1" --mask=black "$2" 2>&1) || {
+    warn "simctl screenshot --display=$1 failed: $err"
+    return 1
+  }
+}
+
+# capture_display <label> <display-id> <file>
+# --mask=black writes an RGB PNG (App Store Connect rejects alpha). An all-black frame means
+# the display was off, so wait and retry; two identical captures in a row mean the unfold
+# animation finished.
+capture_display() {
+  local label=$1 display=$2 file=$3 tmp attempt=1 rc
+  tmp="${file%.png}.stable.png"
+  while [ "$attempt" -le "$RETRIES" ]; do
+    if simctl_shot "$display" "$file"; then
+      is_all_black "$file"
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        warn "$label display is black (attempt $attempt of $RETRIES); waiting"
+        sleep "$SETTLE"
+        attempt=$((attempt + 1))
+        continue
+      fi
+      if [ "$STABLE" = "0" ]; then
+        return 0
+      fi
+      sleep "$STABLE_GAP"
+      if simctl_shot "$display" "$tmp" && cmp -s "$file" "$tmp"; then
+        rm -f "$tmp"
+        return 0
+      fi
+      [ -f "$tmp" ] && mv "$tmp" "$file"
+      if [ "$attempt" -ge "$RETRIES" ]; then
+        warn "$label capture is still changing after $RETRIES attempts (animation or spinner?); keeping the last frame"
+        return 0
+      fi
+    fi
+    attempt=$((attempt + 1))
+  done
+  rm -f "$tmp"
+  return 1
+}
+
+next_index() {
+  local f n max=0
+  for f in "$OUT_DIR"/outer-[0-9]*-*.png "$OUT_DIR"/inner-[0-9]*-*.png; do
+    [ -f "$f" ] || continue
+    n=${f##*/}
+    n=${n#*-}
+    n=${n%%-*}
+    case "$n" in '' | *[!0-9]*) continue ;; esac
+    n=$((10#$n))
+    [ "$n" -gt "$max" ] && max=$n
+  done
+  echo $((max + 1))
+}
+
+cmd_shoot() {
+  local only=both fold_on=1 sb_on=1 index="" name="" a
+  while [ $# -gt 0 ]; do
+    a=$1
+    case "$a" in
+      -o | --out)
+        [ $# -ge 2 ] || die "$a needs a folder" $EX_USAGE
+        OUT_DIR=$2
+        shift
+        ;;
+      -n | --index)
+        [ $# -ge 2 ] || die "$a needs a number" $EX_USAGE
+        index=$2
+        shift
+        ;;
+      --only)
+        [ $# -ge 2 ] || die "--only needs outer, inner or both" $EX_USAGE
+        only=$2
+        shift
+        ;;
+      --settle)
+        [ $# -ge 2 ] || die "--settle needs seconds" $EX_USAGE
+        SETTLE=$2
+        shift
+        ;;
+      --no-fold) fold_on=0 ;;
+      --no-status-bar) sb_on=0 ;;
+      -h | --help)
+        usage
+        return 0
+        ;;
+      -*) die "unknown option for shoot: $a" $EX_USAGE ;;
+      *)
+        [ -z "$name" ] || die "shoot takes one name; got '$name' and '$a'" $EX_USAGE
+        name=$a
+        ;;
+    esac
+    shift
+  done
+  case "$only" in outer | inner | both) ;; *) die "--only must be outer, inner or both" $EX_USAGE ;; esac
+  [ -n "$name" ] || die "shoot needs a name, e.g. $PROG shoot home" $EX_USAGE
+  name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//')
+  [ -n "$name" ] || die "the name needs letters or digits" $EX_USAGE
+  case "$RETRIES" in '' | *[!0-9]* | 0) die "DUO_SHOTS_RETRIES must be a positive integer" $EX_USAGE ;; esac
+  need_xcrun
+  command -v sips >/dev/null 2>&1 || die "sips not found (macOS only)" $EX_ENV
+  [ "$fold_on" -eq 0 ] || need_hinge
+  resolve_device
+  mkdir -p "$OUT_DIR" || die "cannot create $OUT_DIR" $EX_FAIL
+  if [ -z "$index" ]; then
+    index=$(next_index)
+  else
+    case "$index" in '' | *[!0-9]*) die "--index must be a number" $EX_USAGE ;; esac
+    index=$((10#$index))
+  fi
+  index=$(printf '%02d' "$index")
+
+  if [ "$sb_on" -eq 1 ]; then
+    xcrun simctl status_bar "$DEVICE" override --time 9:41 \
+      --batteryState charged --batteryLevel 100 --wifiBars 3 --cellularBars 4 ||
+      die "status bar override failed" $EX_FAIL
+  fi
+
+  local outer_file="$OUT_DIR/outer-$index-$name.png" inner_file="$OUT_DIR/inner-$index-$name.png" status=0
+  if [ "$only" != inner ]; then
+    [ "$fold_on" -eq 0 ] || fold close
+    capture_display outer "$OUTER_DISPLAY" "$outer_file" || {
+      warn "could not capture the outer display"
+      status=1
+    }
+  fi
+  if [ "$only" != outer ]; then
+    [ "$fold_on" -eq 0 ] || fold open
+    capture_display inner "$INNER_DISPLAY" "$inner_file" || {
+      warn "could not capture the inner display"
+      status=1
+    }
+  fi
+  [ "$fold_on" -eq 0 ] || fold close
+
+  if [ "$only" != inner ] && [ -f "$outer_file" ]; then
+    check_file "$outer_file" || status=1
+  fi
+  if [ "$only" != outer ] && [ -f "$inner_file" ]; then
+    check_file "$inner_file" || status=1
+  fi
+  return "$status"
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+  local cmd="" rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -d | --device)
+        [ $# -ge 2 ] || die "$1 needs a simulator UDID or name" $EX_USAGE
+        DEVICE=$2
+        shift
+        ;;
+      -h | --help)
+        usage
+        return 0
+        ;;
+      -V | --version)
+        echo "$PROG $VERSION"
+        return 0
+        ;;
+      help | version)
+        if [ -n "$cmd" ]; then
+          rest+=("$1") # a word after the command, e.g. a screenshot called "help"
+        elif [ "$1" = help ]; then
+          usage
+          return 0
+        else
+          echo "$PROG $VERSION"
+          return 0
+        fi
+        ;;
+      *)
+        if [ -z "$cmd" ]; then cmd=$1; else rest+=("$1"); fi
+        ;;
+    esac
+    shift
+  done
+  [ -n "$cmd" ] || {
+    usage >&2
+    return $EX_USAGE
+  }
+  case "$cmd" in
+    boot) cmd_boot ;;
+    status-bar) cmd_status_bar "${rest[@]+"${rest[@]}"}" ;;
+    shoot) cmd_shoot "${rest[@]+"${rest[@]}"}" ;;
+    check) cmd_check "${rest[@]+"${rest[@]}"}" ;;
+    *) die "unknown command '$cmd' (see: $PROG help)" $EX_USAGE ;;
+  esac
+}
+
+main "$@"
