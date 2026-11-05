@@ -1,0 +1,17 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats and shellcheck
+        run: brew install bats-core shellcheck
+      - name: Lint
+        run: make lint
+      - name: Test (Simulator and hinge are stubbed)
+        run: make test
