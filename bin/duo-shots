@@ -86,6 +86,7 @@ read_props() { # file -> sets P_W P_H P_ALPHA
   P_W=$(printf '%s\n' "$out" | awk '/pixelWidth/ {print $2}')
   P_H=$(printf '%s\n' "$out" | awk '/pixelHeight/ {print $2}')
   P_ALPHA=$(printf '%s\n' "$out" | awk '/hasAlpha/ {print $2}')
+  case "$P_W$P_H" in '' | *[!0-9]*) return 1 ;; esac
   [ -n "$P_W" ] && [ -n "$P_H" ]
 }
 
@@ -103,7 +104,7 @@ is_all_black() {
     return 2
     ;;
   esac
-  rest=$(tail -c +$((off + 1)) "$bmp" | tr -d '\000' | head -c 1)
+  rest=$(tail -c +$((off + 1)) "$bmp" | LC_ALL=C tr -d '\000' | head -c 1)
   rm -f "$bmp"
   [ -z "$rest" ]
 }

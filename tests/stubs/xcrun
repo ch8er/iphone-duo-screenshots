@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Test stub for `xcrun`. Only understands the simctl calls duo-shots makes.
+# Every call is appended to $STUB_LOG. Fixture PNGs live in $STUB_DIR.
+printf 'xcrun %s\n' "$*" >>"${STUB_LOG:?}"
+[ "${1:-}" = simctl ] || exit 64
+shift
+case "${1:-}" in
+  list)
+    case "$*" in
+      "list devices booted")
+        echo "== Devices =="
+        echo "-- iOS 27.1 --"
+        echo "    iPhone Duo (11111111-2222-3333-4444-555555555555) (Booted)"
+        [ -z "${STUB_EXTRA_PHONE:-}" ] || echo "    iPhone 18 Pro (AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE) (Booted)"
+        ;;
+      "list devices available")
+        echo "== Devices =="
+        echo "-- iOS 27.1 --"
+        [ -n "${STUB_NO_DUO:-}" ] || echo "    iPhone Duo (11111111-2222-3333-4444-555555555555) (Shutdown)"
+        ;;
+      "list runtimes available")
+        echo "== Runtimes =="
+        echo "iOS 26.4 (26.4 - 23E1) - com.apple.CoreSimulator.SimRuntime.iOS-26-4"
+        [ -n "${STUB_NO_RUNTIME:-}" ] || echo "iOS 27.1 (27.1 - 24A94232) - com.apple.CoreSimulator.SimRuntime.iOS-27-1"
+        ;;
+    esac
+    ;;
+  io)
+    udid=$2
+    sub=$3
+    case "$sub" in
+      enumerate)
+        if [ "$udid" = "11111111-2222-3333-4444-555555555555" ]; then
+          printf 'Device Name: primary\nDevice Name: primary-1\n'
+        else
+          printf 'Device Name: primary\n'
+        fi
+        ;;
+      screenshot)
+        display=""
+        file=""
+        for a in "${@:4}"; do
+          case "$a" in
+            --display=*) display=${a#--display=} ;;
+            --mask=*) ;;
+            *) file=$a ;;
+          esac
+        done
+        src="$STUB_DIR/display-$display.png"
+        [ -f "$src" ] || {
+          echo "no such display $display" >&2
+          exit 1
+        }
+        cp "$src" "$file"
+        ;;
+    esac
+    ;;
+  status_bar) ;;
+  create) echo "99999999-8888-7777-6666-555555555555" ;;
+  bootstatus) ;;
+  *) exit 64 ;;
+esac
+exit 0
