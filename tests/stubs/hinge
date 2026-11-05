@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub for `hinge`: logs the call, fails when STUB_HINGE_FAIL is set.
+printf 'hinge %s\n' "$*" >>"${STUB_LOG:?}"
+[ -z "${STUB_HINGE_FAIL:-}" ]
